@@ -28,7 +28,8 @@
 
 // --- Configuration ---
 #define SENDER_BUTTON_GPIO      GPIO_NUM_9      // BOOT button on most ESP32-C3 dev kits
-#define RECEIVER_LED_GPIO       GPIO_NUM_8      // Onboard LED on some ESP32-C3 dev kits
+#define OUTPUT_PIN_GPIO         GPIO_NUM_8      // Output pin controlled by received commands
+#define OUTPUT_LED_GPIO         GPIO_NUM_8      // output LED pin for status indication
 #define UNPAIR_PRESS_DURATION_S 10              // Seconds to hold button to unpair
 #define LED_ON_DURATION_MS      100            // Milliseconds for LED to stay on
 #define PAIRING_RSSI_THRESHOLD  -60             // RSSI threshold for pairing
@@ -87,7 +88,7 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *
     else if (memcmp(recv_info->src_addr, s_peer_mac, ESP_NOW_ETH_ALEN) == 0) {
         if (len == 1 && data[0] == 1) { // Simple "button pressed" command
             ESP_LOGI(TAG, "Button press command received from " MACSTR, MAC2STR(recv_info->src_addr));
-            gpio_set_level(RECEIVER_LED_GPIO, 1);
+            gpio_set_level(OUTPUT_PIN_GPIO, 1);
             // Start or reset the timer to turn the LED off
             xTimerReset(s_led_timer_handle, portMAX_DELAY);
         }
@@ -131,7 +132,7 @@ static void complete_pairing(const uint8_t *mac_addr) {
     if (s_pairing_timer_handle != NULL) {
         xTimerStop(s_pairing_timer_handle, portMAX_DELAY);
     }
-    gpio_set_level(RECEIVER_LED_GPIO, 0);
+    gpio_set_level(OUTPUT_LED_GPIO, 0);
 
     ESP_LOGI(TAG, "Pairing complete with " MACSTR, MAC2STR(s_peer_mac));
 
@@ -240,7 +241,7 @@ static void wifi_espnow_init(void) {
 
 // Timer callback to turn off the LED
 static void led_off_timer_cb(TimerHandle_t xTimer) {
-    gpio_set_level(RECEIVER_LED_GPIO, 0);
+    gpio_set_level(OUTPUT_PIN_GPIO, 0);
     ESP_LOGI(TAG, "LED turned off");
 }
 
@@ -250,7 +251,7 @@ static void pairing_blink_timer_cb(TimerHandle_t xTimer) {
     
     if (s_is_pairing) {
         led_state = !led_state;
-        gpio_set_level(RECEIVER_LED_GPIO, led_state ? 1 : 0);
+        gpio_set_level(OUTPUT_LED_GPIO, led_state ? 1 : 0);
         ESP_LOGD(TAG, "Pairing blink: LED %s", led_state ? "ON" : "OFF");
     }
 }
@@ -274,13 +275,23 @@ static void button_long_press_cb(void *arg, void *usr_data) {
 
 // GPIO and Button Initialization
 static void gpio_init(void) {
-    // Configure LED pin
-    gpio_config_t io_conf = {};
-    io_conf.pin_bit_mask = (1ULL << RECEIVER_LED_GPIO);
-    io_conf.mode = GPIO_MODE_OUTPUT;
-    io_conf.intr_type = GPIO_INTR_DISABLE;
-    gpio_config(&io_conf);
-    gpio_set_level(RECEIVER_LED_GPIO, 0); // Start with LED off
+    // Configure output pin (controlled by received commands)
+    gpio_config_t output_pin_conf = {};
+    output_pin_conf.pin_bit_mask = (1ULL << OUTPUT_PIN_GPIO);
+    output_pin_conf.mode = GPIO_MODE_OUTPUT;
+    output_pin_conf.intr_type = GPIO_INTR_DISABLE;
+    gpio_config(&output_pin_conf);
+    gpio_set_level(OUTPUT_PIN_GPIO, 0); // Start with output pin off
+
+    // Configure LED pin (for pairing animation) - only if different from output pin
+    if (OUTPUT_LED_GPIO != OUTPUT_PIN_GPIO) {
+        gpio_config_t led_conf = {};
+        led_conf.pin_bit_mask = (1ULL << OUTPUT_LED_GPIO);
+        led_conf.mode = GPIO_MODE_OUTPUT;
+        led_conf.intr_type = GPIO_INTR_DISABLE;
+        gpio_config(&led_conf);
+        gpio_set_level(OUTPUT_LED_GPIO, 0); // Start with LED off
+    }
 
     // Create a one-shot timer for the LED
     s_led_timer_handle = xTimerCreate("led_off_timer", pdMS_TO_TICKS(LED_ON_DURATION_MS),
