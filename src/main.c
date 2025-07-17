@@ -33,7 +33,7 @@
 #define UNPAIR_PRESS_DURATION_S 10              // Seconds to hold button to unpair
 #define LED_ON_DURATION_MS      100            // Milliseconds for LED to stay on
 #define OUTPUT_PIN_ACTIVE_LEVEL 1 // Active level for the output pin (1 = high, 0 = low)
-#define OUTPUT_PIN_ACTIVE_TIME_MS  100
+#define OUTPUT_PIN_ACTIVE_TIME_MS  250
 #define PAIRING_RSSI_THRESHOLD  -60             // RSSI threshold for pairing
 #define NVS_PEER_MAC_KEY        "peer_mac"      // NVS key for storing peer MAC
 
