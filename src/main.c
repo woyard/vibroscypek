@@ -1,17 +1,3 @@
-/*
- * ESP32-C3 ESP-NOW Pairing & Control Firmware
- *
- * This firmware allows two ESP32-C3 devices to be paired and for one to
- * control an LED on the other using a button press.
- *
- * Features:
- * 1. Pairing: Devices pair with the first available peer within a specific RSSI range.
- * 2. Control: A button press on one device sends a command to the other.
- * 3. Action: The receiving device turns on an LED for a set duration.
- * 4. Persistence: The pairing is saved in Non-Volatile Storage (NVS) and persists across reboots.
- * 5. Unpairing: A long press on the button (10 seconds) clears the pairing and restarts the process.
- */
-
 #include <stdio.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
@@ -27,15 +13,15 @@
 #include "button_gpio.h"
 
 // --- Configuration ---
-#define SENDER_BUTTON_GPIO      GPIO_NUM_0      // GPIO0 with internal pulldown
-#define OUTPUT_PIN_GPIO         GPIO_NUM_10      // Output pin controlled by received commands
-#define OUTPUT_LED_GPIO         GPIO_NUM_8      // output LED pin for status indication
-#define UNPAIR_PRESS_DURATION_S 10              // Seconds to hold button to unpair
+#define SENDER_BUTTON_GPIO      GPIO_NUM_0     // GPIO0 with internal pulldown
+#define OUTPUT_PIN_GPIO         GPIO_NUM_10    // Output pin controlled by received commands
+#define OUTPUT_LED_GPIO         GPIO_NUM_8     // output LED pin for status indication
+#define UNPAIR_PRESS_DURATION_MS 7000         // Milliseconds to hold button to unpair
 #define LED_ON_DURATION_MS      100            // Milliseconds for LED to stay on
-#define OUTPUT_PIN_ACTIVE_LEVEL 1 // Active level for the output pin (1 = high, 0 = low)
+#define OUTPUT_PIN_ACTIVE_LEVEL 1              // Active level for the output pin (1 = high, 0 = low)
 #define OUTPUT_PIN_ACTIVE_TIME_MS  250
-#define PAIRING_RSSI_THRESHOLD  -60             // RSSI threshold for pairing
-#define NVS_PEER_MAC_KEY        "peer_mac"      // NVS key for storing peer MAC
+#define PAIRING_RSSI_THRESHOLD  -60            // RSSI threshold for pairing
+#define NVS_PEER_MAC_KEY        "peer_mac"     // NVS key for storing peer MAC
 
 static const char *TAG = "VIBROSCYPEK";
 
@@ -45,6 +31,7 @@ static bool s_is_paired = false;
 static bool s_is_pairing = false;
 static TimerHandle_t s_output_pin_timer_handle;
 static TimerHandle_t s_pairing_timer_handle;
+static SemaphoreHandle_t s_led_semaphore = NULL;
 
 // --- Function Declarations ---
 static void espnow_send_cb(const uint8_t *mac_addr, esp_now_send_status_t status);
@@ -134,7 +121,6 @@ static void complete_pairing(const uint8_t *mac_addr) {
     if (s_pairing_timer_handle != NULL) {
         xTimerStop(s_pairing_timer_handle, portMAX_DELAY);
     }
-    gpio_set_level(OUTPUT_LED_GPIO, 0);
 
     ESP_LOGI(TAG, "Pairing complete with " MACSTR, MAC2STR(s_peer_mac));
 
@@ -179,9 +165,7 @@ static void unpair_device(void) {
     s_is_paired = false;
 
     ESP_LOGI(TAG, "Device unpaired. Restarting pairing process.");
-    
-    // Triple blink to indicate unpairing
-    status_blink(3, 150);
+    status_blink(5, 150);
     
     start_pairing();
 }
@@ -234,31 +218,19 @@ static esp_err_t save_peer_mac(const uint8_t *mac_addr) {
 
 // Quick status blink function for inline status indications
 static void status_blink(int blink_count, int delay_ms) {
-    // Temporarily stop pairing animation if running to avoid conflicts
-    bool was_pairing = s_is_pairing;
-    if (was_pairing && s_pairing_timer_handle != NULL) {
-        xTimerStop(s_pairing_timer_handle, portMAX_DELAY);
-    }
-    
-    // Remember the current LED state
-    int current_level = gpio_get_level(OUTPUT_LED_GPIO);
-    
-    // Perform the blink sequence
-    for (int i = 0; i < blink_count; i++) {
-        gpio_set_level(OUTPUT_LED_GPIO, 1);
-        vTaskDelay(pdMS_TO_TICKS(delay_ms));
-        gpio_set_level(OUTPUT_LED_GPIO, 0);
-        if (i < blink_count - 1) { // Don't delay after the last blink
+    if (xSemaphoreTake(s_led_semaphore, portMAX_DELAY) == pdTRUE) {
+        for (int i = 0; i < blink_count; i++) {
+            gpio_set_level(OUTPUT_LED_GPIO, 1);
             vTaskDelay(pdMS_TO_TICKS(delay_ms));
+            gpio_set_level(OUTPUT_LED_GPIO, 0);
+            if (i < blink_count - 1) { // Don't delay after the last blink
+                vTaskDelay(pdMS_TO_TICKS(delay_ms));
+            }
         }
-    }
-    
-    // Restore the original LED state
-    gpio_set_level(OUTPUT_LED_GPIO, current_level);
-    
-    // Resume pairing animation if it was running
-    if (was_pairing && s_pairing_timer_handle != NULL) {
-        xTimerStart(s_pairing_timer_handle, portMAX_DELAY);
+        gpio_set_level(OUTPUT_LED_GPIO, 0);
+        xSemaphoreGive(s_led_semaphore);
+    } else {
+        ESP_LOGE(TAG, "Failed to take LED semaphore for status blink");
     }
 }
 
@@ -291,9 +263,15 @@ static void pairing_blink_timer_cb(TimerHandle_t xTimer) {
     static bool led_state = false;
     
     if (s_is_pairing) {
-        led_state = !led_state;
-        gpio_set_level(OUTPUT_LED_GPIO, led_state ? 1 : 0);
-        ESP_LOGD(TAG, "Pairing blink: LED %s", led_state ? "ON" : "OFF");
+        // Try to take the semaphore without waiting - skip if LED is busy
+        if (xSemaphoreTake(s_led_semaphore, 0) == pdTRUE) {
+            led_state = !led_state;
+            gpio_set_level(OUTPUT_LED_GPIO, led_state ? 1 : 0);
+            ESP_LOGD(TAG, "Pairing blink: LED %s", led_state ? "ON" : "OFF");
+            xSemaphoreGive(s_led_semaphore);
+        } else {
+            ESP_LOGD(TAG, "Pairing blink: LED busy, skipping");
+        }
     }
 }
 
@@ -324,16 +302,19 @@ static void gpio_init(void) {
     gpio_config(&output_pin_conf);
     gpio_set_level(OUTPUT_PIN_GPIO, !OUTPUT_PIN_ACTIVE_LEVEL); // Start with pin off
 
-    // Configure LED pin (for pairing animation) - only if different from output pin
-    if (OUTPUT_LED_GPIO != OUTPUT_PIN_GPIO) {
-        gpio_config_t led_conf = {};
-        led_conf.pin_bit_mask = (1ULL << OUTPUT_LED_GPIO);
-        led_conf.mode = GPIO_MODE_OUTPUT;
-        led_conf.intr_type = GPIO_INTR_DISABLE;
-        gpio_config(&led_conf);
-        gpio_set_level(OUTPUT_LED_GPIO, 0); // Start with LED off
+    gpio_config_t led_conf = {};
+    led_conf.pin_bit_mask = (1ULL << OUTPUT_LED_GPIO);
+    led_conf.mode = GPIO_MODE_OUTPUT;
+    led_conf.intr_type = GPIO_INTR_DISABLE;
+    gpio_config(&led_conf);
+    gpio_set_level(OUTPUT_LED_GPIO, 0); // Start with LED off
+    
+    // Create LED semaphore for coordinating access
+    s_led_semaphore = xSemaphoreCreateMutex();
+    if (s_led_semaphore == NULL) {
+        ESP_LOGE(TAG, "Failed to create LED semaphore");
     }
-
+    
     // Create a one-shot timer for the output pin
     s_output_pin_timer_handle = xTimerCreate("pin_off_timer", pdMS_TO_TICKS(OUTPUT_PIN_ACTIVE_TIME_MS),
                                       pdFALSE, // One-shot timer
@@ -346,7 +327,7 @@ static void gpio_init(void) {
 
     // Configure Button
     button_config_t btn_cfg = {
-        .long_press_time = UNPAIR_PRESS_DURATION_S * 1000,
+        .long_press_time = UNPAIR_PRESS_DURATION_MS,
         .short_press_time = 50,
     };
     
