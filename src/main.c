@@ -28,10 +28,12 @@
 
 // --- Configuration ---
 #define SENDER_BUTTON_GPIO      GPIO_NUM_0      // GPIO0 with internal pulldown
-#define OUTPUT_PIN_GPIO         GPIO_NUM_8      // Output pin controlled by received commands
+#define OUTPUT_PIN_GPIO         GPIO_NUM_10      // Output pin controlled by received commands
 #define OUTPUT_LED_GPIO         GPIO_NUM_8      // output LED pin for status indication
 #define UNPAIR_PRESS_DURATION_S 10              // Seconds to hold button to unpair
 #define LED_ON_DURATION_MS      100            // Milliseconds for LED to stay on
+#define OUTPUT_PIN_ACTIVE_LEVEL 1 // Active level for the output pin (1 = high, 0 = low)
+#define OUTPUT_PIN_ACTIVE_TIME_MS  100
 #define PAIRING_RSSI_THRESHOLD  -60             // RSSI threshold for pairing
 #define NVS_PEER_MAC_KEY        "peer_mac"      // NVS key for storing peer MAC
 
@@ -41,7 +43,7 @@ static const char *TAG = "VIBROSCYPEK";
 static uint8_t s_peer_mac[ESP_NOW_ETH_ALEN] = {0};
 static bool s_is_paired = false;
 static bool s_is_pairing = false;
-static TimerHandle_t s_led_timer_handle;
+static TimerHandle_t s_output_pin_timer_handle;
 static TimerHandle_t s_pairing_timer_handle;
 
 // --- Function Declarations ---
@@ -89,9 +91,8 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *
     else if (memcmp(recv_info->src_addr, s_peer_mac, ESP_NOW_ETH_ALEN) == 0) {
         if (len == 1 && data[0] == 1) { // Simple "button pressed" command
             ESP_LOGI(TAG, "Button press command received from " MACSTR, MAC2STR(recv_info->src_addr));
-            gpio_set_level(OUTPUT_PIN_GPIO, 1);
-            // Start or reset the timer to turn the LED off
-            xTimerReset(s_led_timer_handle, portMAX_DELAY);
+            gpio_set_level(OUTPUT_PIN_GPIO, OUTPUT_PIN_ACTIVE_LEVEL);
+            xTimerReset(s_output_pin_timer_handle, portMAX_DELAY);
         }
     }
 }
@@ -279,10 +280,10 @@ static void wifi_espnow_init(void) {
     ESP_ERROR_CHECK(esp_now_register_recv_cb(espnow_recv_cb));
 }
 
-// Timer callback to turn off the LED
-static void led_off_timer_cb(TimerHandle_t xTimer) {
-    gpio_set_level(OUTPUT_PIN_GPIO, 0);
-    ESP_LOGI(TAG, "LED turned off");
+// Timer callback to turn off the output pin
+static void output_pin_off_timer_cb(TimerHandle_t xTimer) {
+    gpio_set_level(OUTPUT_PIN_GPIO, !OUTPUT_PIN_ACTIVE_LEVEL);
+    ESP_LOGI(TAG, "Output pin turned off");
 }
 
 // Timer callback for pairing LED blink animation
@@ -321,7 +322,7 @@ static void gpio_init(void) {
     output_pin_conf.mode = GPIO_MODE_OUTPUT;
     output_pin_conf.intr_type = GPIO_INTR_DISABLE;
     gpio_config(&output_pin_conf);
-    gpio_set_level(OUTPUT_PIN_GPIO, 0); // Start with output pin off
+    gpio_set_level(OUTPUT_PIN_GPIO, !OUTPUT_PIN_ACTIVE_LEVEL); // Start with pin off
 
     // Configure LED pin (for pairing animation) - only if different from output pin
     if (OUTPUT_LED_GPIO != OUTPUT_PIN_GPIO) {
@@ -333,10 +334,10 @@ static void gpio_init(void) {
         gpio_set_level(OUTPUT_LED_GPIO, 0); // Start with LED off
     }
 
-    // Create a one-shot timer for the LED
-    s_led_timer_handle = xTimerCreate("led_off_timer", pdMS_TO_TICKS(LED_ON_DURATION_MS),
+    // Create a one-shot timer for the output pin
+    s_output_pin_timer_handle = xTimerCreate("pin_off_timer", pdMS_TO_TICKS(OUTPUT_PIN_ACTIVE_TIME_MS),
                                       pdFALSE, // One-shot timer
-                                      (void *)0, led_off_timer_cb);
+                                      (void *)0, output_pin_off_timer_cb);
 
     // Create a repeating timer for pairing LED blink animation (1 second interval)
     s_pairing_timer_handle = xTimerCreate("pairing_blink_timer", pdMS_TO_TICKS(1000),
