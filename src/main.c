@@ -41,7 +41,8 @@ typedef struct {
 
 // Command types
 #define CMD_PAIRING_REQUEST     0x0001
-#define CMD_BUTTON_PRESS        0x0002
+#define CMD_PAIRING_RESPONSE    0x0002
+#define CMD_BUTTON_PRESS        0x0003
 
 // Button states for payload
 #define BUTTON_STATE_PRESSED    0x0001
@@ -67,13 +68,31 @@ static TaskHandle_t s_led_task_handle = NULL;
 // --- Function Declarations ---
 static void espnow_send_cb(const uint8_t *mac_addr, esp_now_send_status_t status);
 static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len);
+
+// Message processing functions
+static void process_pairing_message(const esp_now_recv_info_t *recv_info, const message_t *msg);
+static void process_operational_message(const esp_now_recv_info_t *recv_info, const message_t *msg);
+static void handle_pairing_request(const esp_now_recv_info_t *recv_info, const message_t *msg);
+static void handle_pairing_response(const esp_now_recv_info_t *recv_info, const message_t *msg);
+static void handle_incoming_button_press(const esp_now_recv_info_t *recv_info, const message_t *msg);
+
+// Pairing management functions
 static void start_pairing(void);
 static void complete_pairing(const uint8_t *mac_addr);
 static void unpair_device(void);
 static esp_err_t load_peer_mac(void);
 static esp_err_t save_peer_mac(const uint8_t *mac_addr);
+
+// Peer management functions
+static esp_err_t add_peer_if_needed(const uint8_t *mac_addr);
+static esp_err_t remove_peer_if_exists(const uint8_t *mac_addr);
+
+// Message creation functions
 static message_t create_pairing_request_message(void);
+static message_t create_pairing_response_message(void);
 static message_t create_button_press_message(uint16_t button_state);
+
+// LED management functions
 static void led_task(void *pvParameters);
 static esp_err_t queue_led_command(uint8_t blink_count, uint16_t delay_ms, bool high_priority);
 
@@ -98,56 +117,156 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *
 
     message_t *msg = (message_t*)data;
 
-    // If not paired, check for pairing requests
+    // Route message based on pairing status
     if (!s_is_paired) {
-        if (msg->command_type == CMD_PAIRING_REQUEST) {
-            // Verify pairing code
-            if (msg->payload == PAIRING_CODE) {
-                // Check RSSI to ensure the device is nearby
-                if (recv_info->rx_ctrl->rssi > PAIRING_RSSI_THRESHOLD) {
-                    ESP_LOGI(TAG, "Valid pairing request received from " MACSTR " with RSSI: %d",
-                             MAC2STR(recv_info->src_addr), recv_info->rx_ctrl->rssi);
-                    complete_pairing(recv_info->src_addr);
-                } else {
-                    ESP_LOGW(TAG, "Ignoring pairing request from " MACSTR " due to weak signal (RSSI: %d)",
-                             MAC2STR(recv_info->src_addr), recv_info->rx_ctrl->rssi);
-                }
-            } else {
-                ESP_LOGW(TAG, "Invalid pairing code received from " MACSTR " (expected: 0x%04X, got: 0x%04X)",
-                         MAC2STR(recv_info->src_addr), PAIRING_CODE, msg->payload);
-            }
-        }
+        process_pairing_message(recv_info, msg);
+    } else {
+        process_operational_message(recv_info, msg);
     }
-    // If paired, check if the message is from the known peer
-    else if (memcmp(recv_info->src_addr, s_peer_mac, ESP_NOW_ETH_ALEN) == 0) {
-        if (msg->command_type == CMD_BUTTON_PRESS) {
-            ESP_LOGI(TAG, "Button press command received from " MACSTR " (state: %s)", 
-                     MAC2STR(recv_info->src_addr),
-                     msg->payload == BUTTON_STATE_PRESSED ? "PRESSED" : "RELEASED");
-            
-            if (msg->payload == BUTTON_STATE_PRESSED) {
-                gpio_set_level(OUTPUT_PIN_GPIO, OUTPUT_PIN_ACTIVE_LEVEL);
-                xTimerReset(s_output_pin_timer_handle, portMAX_DELAY);
-            }
-            // Blink LED to indicate button press
-            queue_led_command(1, 100, true); // High priority for button press indication
-        }
+}
+
+// --- Message Processing Functions ---
+
+// Processes messages when device is not paired (pairing mode)
+static void process_pairing_message(const esp_now_recv_info_t *recv_info, const message_t *msg) {
+    switch (msg->command_type) {
+        case CMD_PAIRING_REQUEST:
+            handle_pairing_request(recv_info, msg);
+            break;
+        case CMD_PAIRING_RESPONSE:
+            handle_pairing_response(recv_info, msg);
+            break;
+        default:
+            ESP_LOGD(TAG, "Ignoring non-pairing message while unpaired: 0x%04X", msg->command_type);
+            break;
     }
+}
+
+// Processes messages when device is paired (operational mode)
+static void process_operational_message(const esp_now_recv_info_t *recv_info, const message_t *msg) {
+    // Only accept messages from the known peer
+    if (memcmp(recv_info->src_addr, s_peer_mac, ESP_NOW_ETH_ALEN) != 0) {
+        ESP_LOGW(TAG, "Ignoring message from unknown device " MACSTR " (not paired peer)", 
+                 MAC2STR(recv_info->src_addr));
+        return;
+    }
+
+    switch (msg->command_type) {
+        case CMD_BUTTON_PRESS:
+            handle_incoming_button_press(recv_info, msg);
+            break;
+        default:
+            ESP_LOGW(TAG, "Unknown operational command: 0x%04X", msg->command_type);
+            break;
+    }
+}
+
+// Handles incoming pairing requests
+static void handle_pairing_request(const esp_now_recv_info_t *recv_info, const message_t *msg) {
+    // Verify pairing code
+    if (msg->payload != PAIRING_CODE) {
+        ESP_LOGW(TAG, "Invalid pairing code from " MACSTR " (expected: 0x%04X, got: 0x%04X)",
+                 MAC2STR(recv_info->src_addr), PAIRING_CODE, msg->payload);
+        return;
+    }
+
+    // Check RSSI to ensure the device is nearby
+    if (recv_info->rx_ctrl->rssi <= PAIRING_RSSI_THRESHOLD) {
+        ESP_LOGW(TAG, "Ignoring pairing request from " MACSTR " due to weak signal (RSSI: %d)",
+                 MAC2STR(recv_info->src_addr), recv_info->rx_ctrl->rssi);
+        return;
+    }
+
+    ESP_LOGI(TAG, "Valid pairing request received from " MACSTR " with RSSI: %d",
+             MAC2STR(recv_info->src_addr), recv_info->rx_ctrl->rssi);
+
+    // Add peer temporarily for response
+    if (add_peer_if_needed(recv_info->src_addr) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to add peer for pairing response");
+        return;
+    }
+
+    // Send pairing response
+    message_t response_msg = create_pairing_response_message();
+    esp_err_t send_result = esp_now_send(recv_info->src_addr, (uint8_t*)&response_msg, sizeof(response_msg));
+    if (send_result != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to send pairing response: %s", esp_err_to_name(send_result));
+        return;
+    }
+
+    // Complete pairing
+    complete_pairing(recv_info->src_addr);
+}
+
+// Handles incoming pairing responses
+static void handle_pairing_response(const esp_now_recv_info_t *recv_info, const message_t *msg) {
+    // Verify pairing code in response
+    if (msg->payload != PAIRING_CODE) { 
+        ESP_LOGW(TAG, "Invalid pairing response code from " MACSTR " (expected: 0x%04X, got: 0x%04X)",
+                 MAC2STR(recv_info->src_addr), PAIRING_CODE, msg->payload);
+        return;
+    }
+
+    ESP_LOGI(TAG, "Valid pairing response received from " MACSTR,
+             MAC2STR(recv_info->src_addr));
+    complete_pairing(recv_info->src_addr);
+}
+
+// Handles incoming button press commands
+static void handle_incoming_button_press(const esp_now_recv_info_t *recv_info, const message_t *msg) {
+    ESP_LOGI(TAG, "Button press command received from " MACSTR " (state: %s)", 
+             MAC2STR(recv_info->src_addr),
+             msg->payload == BUTTON_STATE_PRESSED ? "PRESSED" : "RELEASED");
+    
+    if (msg->payload == BUTTON_STATE_PRESSED) {
+        gpio_set_level(OUTPUT_PIN_GPIO, OUTPUT_PIN_ACTIVE_LEVEL);
+        xTimerReset(s_output_pin_timer_handle, portMAX_DELAY);
+    }
+    queue_led_command(1, 100, true); // High priority for button press indication
+}
+
+// --- Peer Management Functions ---
+
+static esp_err_t add_peer_if_needed(const uint8_t *mac_addr) {
+    if (esp_now_is_peer_exist(mac_addr)) {
+        return ESP_OK; // already exists
+    }
+    esp_now_peer_info_t peer_info = {};
+    memcpy(peer_info.peer_addr, mac_addr, ESP_NOW_ETH_ALEN);
+    
+    esp_err_t result = esp_now_add_peer(&peer_info);
+    if (result != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to add peer " MACSTR ": %s", 
+                 MAC2STR(mac_addr), esp_err_to_name(result));
+    }
+    
+    return result;
+}
+
+static esp_err_t remove_peer_if_exists(const uint8_t *mac_addr) {
+    if (!esp_now_is_peer_exist(mac_addr)) {
+        return ESP_OK; // nothing to remove
+    }
+    esp_err_t result = esp_now_del_peer(mac_addr);
+    if (result != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to remove peer " MACSTR ": %s", 
+                 MAC2STR(mac_addr), esp_err_to_name(result));
+    }
+    
+    return result;
 }
 
 // --- Pairing and NVS ---
 
-// Starts the pairing process by broadcasting a message
 static void start_pairing(void) {
     s_is_paired = false;
     s_is_pairing = true;
     ESP_LOGI(TAG, "Starting pairing process...");
     
     // Add the broadcast address to ESP-NOW peer list for sending
-    esp_now_peer_info_t peer_info = {};
-    memcpy(peer_info.peer_addr, s_broadcast_mac, ESP_NOW_ETH_ALEN);
-    if (!esp_now_is_peer_exist(s_broadcast_mac)) {
-        ESP_ERROR_CHECK(esp_now_add_peer(&peer_info));
+    if (add_peer_if_needed(s_broadcast_mac) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to add broadcast peer for pairing");
+        return;
     }
     
     // Send initial pairing request
@@ -160,27 +279,22 @@ static void start_pairing(void) {
     }
 }
 
-// Completes the pairing process once a suitable peer is found
 static void complete_pairing(const uint8_t *mac_addr) {
     memcpy(s_peer_mac, mac_addr, ESP_NOW_ETH_ALEN);
     s_is_paired = true;
     s_is_pairing = false;
 
-    // Stop the pairing broadcast timer
     if (s_pairing_broadcast_timer_handle != NULL) {
         xTimerStop(s_pairing_broadcast_timer_handle, portMAX_DELAY);
     }
 
     ESP_LOGI(TAG, "Pairing complete with " MACSTR, MAC2STR(s_peer_mac));
 
-    // Quick double blink to indicate successful pairing
     queue_led_command(2, 100, true); // High priority for pairing success
 
-    // Add the paired device to the peer list for direct communication
-    esp_now_peer_info_t peer_info = {};
-    memcpy(peer_info.peer_addr, s_peer_mac, ESP_NOW_ETH_ALEN);
-    if (!esp_now_is_peer_exist(s_peer_mac)) {
-        ESP_ERROR_CHECK(esp_now_add_peer(&peer_info));
+    if (add_peer_if_needed(s_peer_mac) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to add paired device to peer list");
+        return;
     }
 
     // Save the peer's MAC to NVS
@@ -204,9 +318,9 @@ static void unpair_device(void) {
     nvs_commit(nvs_handle);
     nvs_close(nvs_handle);
 
-    // Delete from ESP-NOW peer list
-    if (s_is_paired && esp_now_is_peer_exist(s_peer_mac)) {
-        esp_now_del_peer(s_peer_mac);
+    // Remove peer from ESP-NOW peer list
+    if (s_is_paired) {
+        remove_peer_if_exists(s_peer_mac);
     }
 
     // Clear from RAM
@@ -271,6 +385,15 @@ static message_t create_pairing_request_message(void) {
     return msg;
 }
 
+// Creates a pairing response message with the verification code
+static message_t create_pairing_response_message(void) {
+    message_t msg = {
+        .command_type = CMD_PAIRING_RESPONSE,
+        .payload = PAIRING_CODE
+    };
+    return msg;
+}
+
 // Creates a button press message with the specified button state
 static message_t create_button_press_message(uint16_t button_state) {
     message_t msg = {
@@ -320,11 +443,9 @@ static esp_err_t queue_led_command(uint8_t blink_count, uint16_t delay_ms, bool 
     };
     
     BaseType_t result;
-    if (high_priority) {
-        // Send to front of queue for high priority commands
+    if (high_priority) { // Send to front of queue for high priority commands
         result = xQueueSendToFront(s_led_queue, &led_cmd, 0);
-    } else {
-        // Send to back of queue for normal priority commands
+    } else {  // Send to back of queue for normal priority commands
         result = xQueueSendToBack(s_led_queue, &led_cmd, 0);
     }
     
@@ -374,6 +495,7 @@ static void pairing_broadcast_timer_cb(TimerHandle_t xTimer) {
 
 // Button press callbacks
 static void button_single_click_cb(void *arg, void *usr_data) {
+    queue_led_command(1, 50, true); // High priority for button press indication
     if (s_is_paired) {
         ESP_LOGI(TAG, "Button pressed. Sending command to peer.");
         message_t button_msg = create_button_press_message(BUTTON_STATE_PRESSED);
@@ -471,12 +593,12 @@ void app_main(void) {
     // Try to load a paired device from NVS
     if (load_peer_mac() == ESP_OK) {
         // If successful, add the peer to ESP-NOW
-        esp_now_peer_info_t peer_info = {};
-        memcpy(peer_info.peer_addr, s_peer_mac, ESP_NOW_ETH_ALEN);
-        if (!esp_now_is_peer_exist(s_peer_mac)) {
-            ESP_ERROR_CHECK(esp_now_add_peer(&peer_info));
+        if (add_peer_if_needed(s_peer_mac) != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to add stored peer to ESP-NOW");
+            start_pairing();
+        } else {
+            ESP_LOGI(TAG, "Device is already paired. Ready to send/receive.");
         }
-        ESP_LOGI(TAG, "Device is already paired. Ready to send/receive.");
     } else {
         // If not found in NVS, start the pairing process
         ESP_LOGI(TAG, "No paired device found in NVS. Starting pairing.");
