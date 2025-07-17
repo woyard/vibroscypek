@@ -27,7 +27,7 @@
 #include "button_gpio.h"
 
 // --- Configuration ---
-#define SENDER_BUTTON_GPIO      GPIO_NUM_9      // BOOT button on most ESP32-C3 dev kits
+#define SENDER_BUTTON_GPIO      GPIO_NUM_0      // GPIO0 with internal pulldown
 #define OUTPUT_PIN_GPIO         GPIO_NUM_8      // Output pin controlled by received commands
 #define OUTPUT_LED_GPIO         GPIO_NUM_8      // output LED pin for status indication
 #define UNPAIR_PRESS_DURATION_S 10              // Seconds to hold button to unpair
@@ -52,6 +52,7 @@ static void complete_pairing(const uint8_t *mac_addr);
 static void unpair_device(void);
 static esp_err_t load_peer_mac(void);
 static esp_err_t save_peer_mac(const uint8_t *mac_addr);
+static void status_blink(int blink_count, int delay_ms);
 
 // --- ESP-NOW Callbacks ---
 
@@ -136,6 +137,9 @@ static void complete_pairing(const uint8_t *mac_addr) {
 
     ESP_LOGI(TAG, "Pairing complete with " MACSTR, MAC2STR(s_peer_mac));
 
+    // Quick double blink to indicate successful pairing
+    status_blink(2, 100);
+
     // Add the paired device to the peer list for direct communication
     esp_now_peer_info_t peer_info = {};
     memcpy(peer_info.peer_addr, s_peer_mac, ESP_NOW_ETH_ALEN);
@@ -174,6 +178,10 @@ static void unpair_device(void) {
     s_is_paired = false;
 
     ESP_LOGI(TAG, "Device unpaired. Restarting pairing process.");
+    
+    // Triple blink to indicate unpairing
+    status_blink(3, 150);
+    
     start_pairing();
 }
 
@@ -220,6 +228,38 @@ static esp_err_t save_peer_mac(const uint8_t *mac_addr) {
     return err;
 }
 
+
+// --- Status Indication ---
+
+// Quick status blink function for inline status indications
+static void status_blink(int blink_count, int delay_ms) {
+    // Temporarily stop pairing animation if running to avoid conflicts
+    bool was_pairing = s_is_pairing;
+    if (was_pairing && s_pairing_timer_handle != NULL) {
+        xTimerStop(s_pairing_timer_handle, portMAX_DELAY);
+    }
+    
+    // Remember the current LED state
+    int current_level = gpio_get_level(OUTPUT_LED_GPIO);
+    
+    // Perform the blink sequence
+    for (int i = 0; i < blink_count; i++) {
+        gpio_set_level(OUTPUT_LED_GPIO, 1);
+        vTaskDelay(pdMS_TO_TICKS(delay_ms));
+        gpio_set_level(OUTPUT_LED_GPIO, 0);
+        if (i < blink_count - 1) { // Don't delay after the last blink
+            vTaskDelay(pdMS_TO_TICKS(delay_ms));
+        }
+    }
+    
+    // Restore the original LED state
+    gpio_set_level(OUTPUT_LED_GPIO, current_level);
+    
+    // Resume pairing animation if it was running
+    if (was_pairing && s_pairing_timer_handle != NULL) {
+        xTimerStart(s_pairing_timer_handle, portMAX_DELAY);
+    }
+}
 
 // --- Initialization ---
 
@@ -311,9 +351,9 @@ static void gpio_init(void) {
     
     button_gpio_config_t gpio_cfg = {
         .gpio_num = SENDER_BUTTON_GPIO,
-        .active_level = 0, // Button is active low
+        .active_level = 1, // Button is active high (pulls GPIO0 to 3.3V when pressed)
         .enable_power_save = false,
-        .disable_pull = false,
+        .disable_pull = false, // Let iot_button automatically configure pulldown for active_level=1
     };
     
     button_handle_t btn_handle;
