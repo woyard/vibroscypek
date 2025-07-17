@@ -23,6 +23,21 @@
 #define PAIRING_RSSI_THRESHOLD  -60            // RSSI threshold for pairing
 #define PAIRING_REQUEST_INTERVAL_MS 3000       // Milliseconds between pairing request broadcasts
 #define NVS_PEER_MAC_KEY        "peer_mac"     // NVS key for storing peer MAC
+#define PAIRING_CODE            0x1234         // Verification code for pairing
+
+// Message structure for communication
+typedef struct {
+    uint16_t command_type;
+    uint16_t payload;
+} message_t;
+
+// Command types
+#define CMD_PAIRING_REQUEST     0x0001
+#define CMD_BUTTON_PRESS        0x0002
+
+// Button states for payload
+#define BUTTON_STATE_PRESSED    0x0001
+#define BUTTON_STATE_RELEASED   0x0000
 
 static const char *TAG = "VIBROSCYPEK";
 
@@ -43,6 +58,8 @@ static void complete_pairing(const uint8_t *mac_addr);
 static void unpair_device(void);
 static esp_err_t load_peer_mac(void);
 static esp_err_t save_peer_mac(const uint8_t *mac_addr);
+static message_t create_pairing_request_message(void);
+static message_t create_button_press_message(uint16_t button_state);
 static void status_blink(int blink_count, int delay_ms);
 
 // --- ESP-NOW Callbacks ---
@@ -59,29 +76,46 @@ static void espnow_send_cb(const uint8_t *mac_addr, esp_now_send_status_t status
 
 // Receive callback: handles incoming data
 static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len) {
-    if (recv_info->src_addr == NULL || data == NULL || len <= 0) {
-        ESP_LOGE(TAG, "Receive CB error: Invalid data");
+    if (recv_info->src_addr == NULL || data == NULL || len < sizeof(message_t)) {
+        ESP_LOGE(TAG, "Receive CB error: Invalid data or insufficient length");
         return;
     }
 
-    // If not paired, this could be a pairing request
+    message_t *msg = (message_t*)data;
+
+    // If not paired, check for pairing requests
     if (!s_is_paired) {
-        // Check RSSI to ensure the device is nearby
-        if (recv_info->rx_ctrl->rssi > PAIRING_RSSI_THRESHOLD) {
-            ESP_LOGI(TAG, "Pairing request received from " MACSTR " with RSSI: %d",
-                     MAC2STR(recv_info->src_addr), recv_info->rx_ctrl->rssi);
-            complete_pairing(recv_info->src_addr);
-        } else {
-            ESP_LOGW(TAG, "Ignoring pairing request from " MACSTR " due to weak signal (RSSI: %d)",
-                     MAC2STR(recv_info->src_addr), recv_info->rx_ctrl->rssi);
+        if (msg->command_type == CMD_PAIRING_REQUEST) {
+            // Verify pairing code
+            if (msg->payload == PAIRING_CODE) {
+                // Check RSSI to ensure the device is nearby
+                if (recv_info->rx_ctrl->rssi > PAIRING_RSSI_THRESHOLD) {
+                    ESP_LOGI(TAG, "Valid pairing request received from " MACSTR " with RSSI: %d",
+                             MAC2STR(recv_info->src_addr), recv_info->rx_ctrl->rssi);
+                    complete_pairing(recv_info->src_addr);
+                } else {
+                    ESP_LOGW(TAG, "Ignoring pairing request from " MACSTR " due to weak signal (RSSI: %d)",
+                             MAC2STR(recv_info->src_addr), recv_info->rx_ctrl->rssi);
+                }
+            } else {
+                ESP_LOGW(TAG, "Invalid pairing code received from " MACSTR " (expected: 0x%04X, got: 0x%04X)",
+                         MAC2STR(recv_info->src_addr), PAIRING_CODE, msg->payload);
+            }
         }
     }
     // If paired, check if the message is from the known peer
     else if (memcmp(recv_info->src_addr, s_peer_mac, ESP_NOW_ETH_ALEN) == 0) {
-        if (len == 1 && data[0] == 1) { // Simple "button pressed" command
-            ESP_LOGI(TAG, "Button press command received from " MACSTR, MAC2STR(recv_info->src_addr));
-            gpio_set_level(OUTPUT_PIN_GPIO, OUTPUT_PIN_ACTIVE_LEVEL);
-            xTimerReset(s_output_pin_timer_handle, portMAX_DELAY);
+        if (msg->command_type == CMD_BUTTON_PRESS) {
+            ESP_LOGI(TAG, "Button press command received from " MACSTR " (state: %s)", 
+                     MAC2STR(recv_info->src_addr),
+                     msg->payload == BUTTON_STATE_PRESSED ? "PRESSED" : "RELEASED");
+            
+            if (msg->payload == BUTTON_STATE_PRESSED) {
+                gpio_set_level(OUTPUT_PIN_GPIO, OUTPUT_PIN_ACTIVE_LEVEL);
+                xTimerReset(s_output_pin_timer_handle, portMAX_DELAY);
+            }
+            // Blink LED to indicate button press
+            status_blink(1, 100);
         }
     }
 }
@@ -102,8 +136,8 @@ static void start_pairing(void) {
     }
     
     // Send initial pairing request
-    uint8_t pairing_req = 0;
-    esp_now_send(s_broadcast_mac, &pairing_req, sizeof(pairing_req));
+    message_t pairing_msg = create_pairing_request_message();
+    esp_now_send(s_broadcast_mac, (uint8_t*)&pairing_msg, sizeof(pairing_msg));
     
     // Start the periodic pairing broadcast timer
     if (s_pairing_broadcast_timer_handle != NULL) {
@@ -213,6 +247,24 @@ static esp_err_t save_peer_mac(const uint8_t *mac_addr) {
     return err;
 }
 
+// Creates a pairing request message with the verification code
+static message_t create_pairing_request_message(void) {
+    message_t msg = {
+        .command_type = CMD_PAIRING_REQUEST,
+        .payload = PAIRING_CODE
+    };
+    return msg;
+}
+
+// Creates a button press message with the specified button state
+static message_t create_button_press_message(uint16_t button_state) {
+    message_t msg = {
+        .command_type = CMD_BUTTON_PRESS,
+        .payload = button_state
+    };
+    return msg;
+}
+
 
 // --- Status Indication ---
 
@@ -227,7 +279,6 @@ static void status_blink(int blink_count, int delay_ms) {
                 vTaskDelay(pdMS_TO_TICKS(delay_ms));
             }
         }
-        gpio_set_level(OUTPUT_LED_GPIO, 0);
         xSemaphoreGive(s_led_semaphore);
     } else {
         ESP_LOGE(TAG, "Failed to take LED semaphore for status blink");
@@ -263,8 +314,8 @@ static void pairing_broadcast_timer_cb(TimerHandle_t xTimer) {
     if (s_is_pairing) {
         ESP_LOGI(TAG, "Sending pairing request broadcast");
         
-        uint8_t pairing_req = 0;
-        esp_now_send(s_broadcast_mac, &pairing_req, sizeof(pairing_req));
+        message_t pairing_msg = create_pairing_request_message();
+        esp_now_send(s_broadcast_mac, (uint8_t*)&pairing_msg, sizeof(pairing_msg));
         
         status_blink(1, 1000);
     }
@@ -274,8 +325,8 @@ static void pairing_broadcast_timer_cb(TimerHandle_t xTimer) {
 static void button_single_click_cb(void *arg, void *usr_data) {
     if (s_is_paired) {
         ESP_LOGI(TAG, "Button pressed. Sending command to peer.");
-        uint8_t command = 1; // Simple "button pressed" command
-        esp_now_send(s_peer_mac, &command, sizeof(command));
+        message_t button_msg = create_button_press_message(BUTTON_STATE_PRESSED);
+        esp_now_send(s_peer_mac, (uint8_t*)&button_msg, sizeof(button_msg));
     } else {
         ESP_LOGW(TAG, "Button pressed, but not paired. Ignoring.");
     }
