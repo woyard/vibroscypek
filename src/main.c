@@ -21,16 +21,18 @@
 #define OUTPUT_PIN_ACTIVE_LEVEL 1              // Active level for the output pin (1 = high, 0 = low)
 #define OUTPUT_PIN_ACTIVE_TIME_MS  250
 #define PAIRING_RSSI_THRESHOLD  -60            // RSSI threshold for pairing
+#define PAIRING_REQUEST_INTERVAL_MS 3000       // Milliseconds between pairing request broadcasts
 #define NVS_PEER_MAC_KEY        "peer_mac"     // NVS key for storing peer MAC
 
 static const char *TAG = "VIBROSCYPEK";
 
 // --- Global Variables ---
 static uint8_t s_peer_mac[ESP_NOW_ETH_ALEN] = {0};
+static uint8_t s_broadcast_mac[ESP_NOW_ETH_ALEN] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 static bool s_is_paired = false;
 static bool s_is_pairing = false;
 static TimerHandle_t s_output_pin_timer_handle;
-static TimerHandle_t s_pairing_timer_handle;
+static TimerHandle_t s_pairing_broadcast_timer_handle;
 static SemaphoreHandle_t s_led_semaphore = NULL;
 
 // --- Function Declarations ---
@@ -92,23 +94,21 @@ static void start_pairing(void) {
     s_is_pairing = true;
     ESP_LOGI(TAG, "Starting pairing process...");
     
-    // Start the pairing blink animation
-    if (s_pairing_timer_handle != NULL) {
-        xTimerStart(s_pairing_timer_handle, portMAX_DELAY);
-    }
-    
-    // Use the broadcast address to find any listening device
-    uint8_t broadcast_mac[ESP_NOW_ETH_ALEN] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-    
+    // Add the broadcast address to ESP-NOW peer list for sending
     esp_now_peer_info_t peer_info = {};
-    memcpy(peer_info.peer_addr, broadcast_mac, ESP_NOW_ETH_ALEN);
-    if (!esp_now_is_peer_exist(broadcast_mac)) {
+    memcpy(peer_info.peer_addr, s_broadcast_mac, ESP_NOW_ETH_ALEN);
+    if (!esp_now_is_peer_exist(s_broadcast_mac)) {
         ESP_ERROR_CHECK(esp_now_add_peer(&peer_info));
     }
     
-    // Send a simple byte to initiate pairing
+    // Send initial pairing request
     uint8_t pairing_req = 0;
-    esp_now_send(broadcast_mac, &pairing_req, sizeof(pairing_req));
+    esp_now_send(s_broadcast_mac, &pairing_req, sizeof(pairing_req));
+    
+    // Start the periodic pairing broadcast timer
+    if (s_pairing_broadcast_timer_handle != NULL) {
+        xTimerStart(s_pairing_broadcast_timer_handle, portMAX_DELAY);
+    }
 }
 
 // Completes the pairing process once a suitable peer is found
@@ -117,9 +117,9 @@ static void complete_pairing(const uint8_t *mac_addr) {
     s_is_paired = true;
     s_is_pairing = false;
 
-    // Stop the pairing blink animation and turn off LED
-    if (s_pairing_timer_handle != NULL) {
-        xTimerStop(s_pairing_timer_handle, portMAX_DELAY);
+    // Stop the pairing broadcast timer
+    if (s_pairing_broadcast_timer_handle != NULL) {
+        xTimerStop(s_pairing_broadcast_timer_handle, portMAX_DELAY);
     }
 
     ESP_LOGI(TAG, "Pairing complete with " MACSTR, MAC2STR(s_peer_mac));
@@ -142,10 +142,10 @@ static void complete_pairing(const uint8_t *mac_addr) {
 static void unpair_device(void) {
     ESP_LOGI(TAG, "Unpairing device...");
     
-    // Stop pairing animation if running
+    // Stop pairing broadcast timer if running
     s_is_pairing = false;
-    if (s_pairing_timer_handle != NULL) {
-        xTimerStop(s_pairing_timer_handle, portMAX_DELAY);
+    if (s_pairing_broadcast_timer_handle != NULL) {
+        xTimerStop(s_pairing_broadcast_timer_handle, portMAX_DELAY);
     }
     
     // Delete from NVS
@@ -258,20 +258,15 @@ static void output_pin_off_timer_cb(TimerHandle_t xTimer) {
     ESP_LOGI(TAG, "Output pin turned off");
 }
 
-// Timer callback for pairing LED blink animation
-static void pairing_blink_timer_cb(TimerHandle_t xTimer) {
-    static bool led_state = false;
-    
+// Timer callback for pairing broadcast and LED blink animation
+static void pairing_broadcast_timer_cb(TimerHandle_t xTimer) {
     if (s_is_pairing) {
-        // Try to take the semaphore without waiting - skip if LED is busy
-        if (xSemaphoreTake(s_led_semaphore, 0) == pdTRUE) {
-            led_state = !led_state;
-            gpio_set_level(OUTPUT_LED_GPIO, led_state ? 1 : 0);
-            ESP_LOGD(TAG, "Pairing blink: LED %s", led_state ? "ON" : "OFF");
-            xSemaphoreGive(s_led_semaphore);
-        } else {
-            ESP_LOGD(TAG, "Pairing blink: LED busy, skipping");
-        }
+        ESP_LOGI(TAG, "Sending pairing request broadcast");
+        
+        uint8_t pairing_req = 0;
+        esp_now_send(s_broadcast_mac, &pairing_req, sizeof(pairing_req));
+        
+        status_blink(1, 1000);
     }
 }
 
@@ -320,10 +315,10 @@ static void gpio_init(void) {
                                       pdFALSE, // One-shot timer
                                       (void *)0, output_pin_off_timer_cb);
 
-    // Create a repeating timer for pairing LED blink animation (1 second interval)
-    s_pairing_timer_handle = xTimerCreate("pairing_blink_timer", pdMS_TO_TICKS(1000),
-                                          pdTRUE, // Auto-reload timer (repeating)
-                                          (void *)0, pairing_blink_timer_cb);
+    // Create a repeating timer for pairing broadcast and LED blink animation
+    s_pairing_broadcast_timer_handle = xTimerCreate("pairing_broadcast_timer", pdMS_TO_TICKS(PAIRING_REQUEST_INTERVAL_MS),
+                                                    pdTRUE, // Auto-reload timer (repeating)
+                                                    (void *)0, pairing_broadcast_timer_cb);
 
     // Configure Button
     button_config_t btn_cfg = {
