@@ -40,6 +40,6 @@ Assembled with love, solder, and whatever was available.
 * 2x Tiny BMS PCBs
 * 2x Rechargeable Li-Ion batteries (did you know the 'disposable' e-cigs that people throw out come with a perfectly re-usable battery?!)
 * The disembodied guts of various e-cigarettes and other drawer treasures
-* 3D printed `oscypek.stl` files (TODO: upload to printables.com)
+* 3D printed `vibrooscypek.stl` files [here on printables.com](https://www.printables.com/model/1359133-vibroscypek)
 
 ---
