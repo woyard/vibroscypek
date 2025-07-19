@@ -40,6 +40,7 @@ Assembled with love, solder, and whatever was available.
 * 2x Tiny BMS PCBs
 * 2x Rechargeable Li-Ion batteries (did you know the 'disposable' e-cigs that people throw out come with a perfectly re-usable battery?!)
 * The disembodied guts of various e-cigarettes and other drawer treasures
+* 16x small magnets (5x2.5mm) - .step file attached, so you can adjust to what you have on hand
 * 3D printed `vibrooscypek.stl` files [here on printables.com](https://www.printables.com/model/1359133-vibroscypek)
 
 ---
